@@ -47,9 +47,19 @@ library(tipr)
 tidymodels_prefer()
 ```
 
+As an example, we'll excerpt the [chapter](https://www.r-causal.org/chapters/chapter-02.html) "[t]he whole game: mosquito nets and malaria" from Causal Inference in R. Using the `net_data` data from the [causalworkshop](https://github.com/malcolmbarrett/causalworkshop) package, the chapter provides a worked example addressing the question:
+
+> ...does using a bed net reduce the risk of malaria?
+
+The `net_data` dataset looks like this:
+
+```{r}
+str(net_data)
+```
+
 ## As-is
 
-The approach currently in Causal Inference in R combines some tidymodels machinery with base R modeling functions and some dplyr. The approach is, loosely:
+The approach to resampling the modeling workflow to approxing the sampling distribution currently in Causal Inference in R combines some tidymodels machinery with base R modeling functions and some dplyr. The approach is, loosely:
 
 -   Define a function that, given a data split, fits a propensity model, generates propensity scores based on that model, fits the outcome model using those scores, and returns its coefficients.
 
