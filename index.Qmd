@@ -15,11 +15,11 @@ We'll outline a few different proposals for "tidy" interfaces to causal inferenc
 
 -   [**As-is**] the implementation of tidy causal inference implemented in [Causal Inference in R](https://www.r-causal.org/), will serve as a reference point. The tooling situates `lm()` and `glm()` fits in tidyverse syntax, occasionally making use of tidymodels for its data structures.
 
--   [**With tidymodels proper, no modifications**] takes a similar approach, but substitutes `lm()` and `glm()` with their parsnip wrappers and leans a bit more heavily on tidymodels' data structures, easing the prickly points of interfacing with those models in a few places. To users with a familiarity for tidymodels idioms, though, this interface is a painful substitute for helpful tidymodels abstractions.
+-   [**With tidymodels proper, no modifications**] proposes two approaches. One follows the "as-is" implementation closely but substitutes `lm()` and `glm()` with their parsnip wrappers, easing the prickly points of interfacing with those models in a few places. To users familiar with tidymodels idioms, though, this interface feels like an "unpacked" call to `fit_resamples()`; we thus also try to reframe this approach as two calls to `fit_resamples()`, one for the propensity and another for the outcome model.
 
 -   [**With infer**] is based on a fork of the inference-forward tidymodels package infer. While the existing tooling nearly readily accommodates two-stage modeling workflows, many of the changes needed in the package are light (and probably unhelpful) abstractions of dplyr/purrr functionality, and the addition of this functionality would constitute a substantial departure from the package's current scope.
 
--   [**With tidymodels proper**] is based on forks of the workflows and tune packages that make the minimal changes needed to accommodate "tidymodels-idiomatic" causal inference. It feels good.
+-   [**With tidymodels proper**] proposes two different possible sets of modifications to the tidymodels packages that could accommodate "tidymodels-idiomatic" causal inference.
 
 ## Setup
 
@@ -123,39 +123,112 @@ res_rc |>
 
 ## With tidymodels proper, no modifications
 
-A tidymodels-esque approach using only currently implemented syntax could switch out `lm()` and `glm()` for their tidymodels analogues. These lines also situate the modeling steps as row-wise `mutate()`s rather than in a stand-alone function, but those changes aren't necessary.
+A tidymodels-esque approach using only currently implemented syntax could switch out `lm()` and `glm()` for their tidymodels analogues. Otherwise, we'll follow the "as-is" apprach closely:
 
 ```{r}
 set.seed(1)
 
-res_tm <- 
-   net_data %>%
-   mutate(net = as.factor(net)) %>%
-   bootstraps(times = 1000, apparent = TRUE) %>%
-   mutate(
-      res = map(splits, analysis)
-   ) %>%
-   rowwise() %>%
-   mutate(
-      fit_propensity = list(fit(logistic_reg(), net ~ income + health + temperature, res)),
-      res = list(bind_cols(res, predict(fit_propensity, res, type = "prob"))),
-      res = list(res %>% mutate(wts = wt_ate(.pred_TRUE, net, .treated = "TRUE"),
-                                wts = importance_weights(wts))),
-      fit_outcome = list(fit(linear_reg(), malaria_risk ~ net, res, case_weights = res$wts))
-   )
-```
+bootstrapped_net_data <- bootstraps(
+   net_data %>% mutate(net = as.factor(net)),
+   times = 1000,
+   # required to calculate CIs later
+   apparent = TRUE
+)
 
-Note that this is, roughly, just an "unpacked" call to `fit_resamples()`, where the propensity model, weighting based on its predictions, and outcome model are combined into one workflow. See [With tidymodels proper] below for an implementation of that idea!
+fit_tm <- function(split, ...) {
+   # get bootstrapped data sample with `rsample::analysis()`
+   .df <- analysis(split)
+   
+   # fit propensity score model
+   propensity_model <- fit(logistic_reg(), net ~ income + health + temperature, .df)
+   
+   # calculate inverse probability weights
+   .df <-
+      bind_cols(.df, predict(propensity_model, .df, type = "prob")) %>%
+      mutate(wts = importance_weights(wt_ate(.pred_TRUE, net, .treated = "TRUE")))
+   
+   # fit correctly bootstrapped ipw model
+   fit(linear_reg(), malaria_risk ~ net, .df, case_weights = .df$wts) %>% tidy()
+}
+
+set.seed(1)
+
+res_tm <- bootstrapped_net_data %>%
+   mutate(boot_fits = map(splits, fit_tm))
+```
 
 Reproducing the same plot:
 
 ```{r}
-res_tm %>%
+res_rc %>%
   mutate(
-    estimate = tidy(fit_outcome) %>% filter(term == "netTRUE")  %>% pull(estimate)
+    estimate = map_dbl(
+      boot_fits,
+      ~ .x %>% filter(term == "netTRUE") %>% pull(estimate)
+    )
   ) %>%
   ggplot(aes(estimate)) +
   geom_histogram(fill = "#D55E00FF", color = "white", alpha = 0.8, bins = 30)
+```
+
+Note that this is, roughly, just an "unpacked" call to `fit_resamples()`, where the propensity model, weighting based on its predictions, and outcome model are combined into one workflow. [A later section] describes some of the considerations involved in such a workflow; for now, let's also try to situate this approach within the usual `fit_resamples()` machinery. Ideally, an approach like:
+
+``` r
+res <-
+  fit_resamples(propensity_wf, bootstraps(data)) %>%
+  ... %>%
+  fit_resamples(outcome_wf, .)
+```
+
+could feel expressive and flexible. Also, it effectively separates the propensity and outcome models, encouraging the interactive development of the two models separately and only combining them when resampling their estimates.
+
+In reality, the ellipses in the above pseudocode are quite involved; we want to keep the splits from `bootstraps(data)` intact, while substituting the data that underlies them. That would look something like:
+
+```{r}
+wf_propensity <- workflow(net ~ income + health + temperature, logistic_reg())
+wf_outcome <- workflow(malaria_risk ~ net, linear_reg())
+
+res_tm2 <- 
+    # propensity fits ---------------------------------------------------------------------
+   fit_resamples(
+      wf_propensity, 
+      bootstrapped_net_data, 
+      control = control_resamples(extract = identity)
+   ) %>%
+   # mutating analysis set predictions onto "data" slot of the rset ------------------------
+   collect_extracts() %>%
+   right_join(bootstrapped_net_data, by = "id") %>%
+   rowwise() %>%
+   mutate(
+     res = list(
+       analysis(splits) %>%
+       bind_cols(., predict(.extracts, ., type = "prob")) %>%
+       mutate(wts = importance_weights(wt_ate(.pred_TRUE, net, .treated = "TRUE"))) %>%
+       filter(!duplicated(id)) %>%
+       right_join(splits[["data"]], by = "id", suffix = c(".x", "")) %>%
+       arrange(id)
+     ),
+     splits = list(assign_in(splits, "data", res))
+   ) %>%
+   {manual_rset(splits = .$splits, ids = .$id)} %>%
+   # outcome fits --------------------------------------------------------------------------
+   fit_resamples(
+      wf_outcome %>% add_case_weights(wts), 
+      resamples = .,
+      control = control_resamples(extract = tidy)
+   ) %>%
+   collect_extracts()
+```
+
+The row-wise mutate steps are especially tricky, and small mistakes in the bootstrap "substitution" code can lead to plausible-looking results that actually mischaractize the variation of the estimate. It does give the same results, though:
+
+```{r}
+res_tm2 %>%
+   pull(.extracts) %>%
+   bind_rows() %>%
+   filter(term == "netTRUE") %>% 
+   ggplot(aes(estimate)) +
+   geom_histogram(fill = "#D55E00FF", color = "white", alpha = 0.8, bins = 30)
 ```
 
 ## With infer
@@ -319,7 +392,45 @@ res_in %>%
   geom_histogram(fill = "#D55E00FF", color = "white", alpha = 0.8, bins = 30)
 ```
 
+That said, this approach leans heavily on dplyr and tidyr outside of infer's core verbs, and the abstraction introduced by infer's core verbs ultimately feels unhelpful given how lightly they wrap those tidyverse "basics" with these modifications. Further, the departure from infer's current scope that these changes would entail is quite drastic.
+
 ## With tidymodels proper
+
+### Two workflows for two stages
+
+An approach that situates each of the models in their own workflow best makes use of existing tidymodels machinery for model development and resampling. The biggest hitch, though, arises when augmenting the propensity weights onto the outcome model's training resamples when fitting the models in tandem. 
+
+```{r}
+#| eval: false
+wf_propensity <- workflow(net ~ income + health + temperature, logistic_reg())
+wf_outcome <- workflow(malaria_risk ~ net, linear_reg())
+
+res_tm2 <- 
+    # propensity fits ---------------------------------------------------------------------
+   fit_resamples(
+      wf_propensity, 
+      bootstrapped_net_data, 
+      control = control_resamples(extract = identity)
+   ) %>%
+   # mutating analysis set predictions onto "data" slot of the rset ------------------------
+   augment_resamples() %>%
+   # outcome fits --------------------------------------------------------------------------
+   fit_resamples(
+      wf_outcome %>% add_case_weights(wts), 
+      resamples = .,
+      control = control_resamples(extract = tidy)
+   ) %>%
+   collect_extracts()
+```
+
+`augment_resamples` could live as its own helper, or even wrap an `augment.rset()` method as `augment.tune_results()`.
+
+### A unified workflow
+
+Another alternative interface is to combine both the propensity and outcome models into one `workflow` object. This would allow for the user to just make one call to `fit_resamples()`, but:
+
+* Arguably discourages the user from developing the propensity model iteratively and interactively. While the approach decreases friction in resampling the joined propensity and outcome models, it makes interfacing with the propensity model by itself awkward.
+* Would require many changes to `workflow` objects and the API to interface with them.
 
 At surface level, workflows will just need to introduce a few new functions to accommodate propensity-related modeling steps. These changes are actually quite fundamental, though, because they mean that `add_*()` steps now need to become composable and respect order. Re: composability, for example, `add_model()` steps currently don't allow for the addition of a model unless there is no existing model, but now need to allow both a propensity and outcome model to exist in the workflow. As for ordering, these functions assign `weight`s which can be passed explicitly via an argument by the same name.
 
@@ -346,4 +457,4 @@ Here:
 
 -   Associating pairs of preprocessors and models will require some thought---preprocessors and models with the same `weight` could be associated with each other, and pairs that appear consecutively in a pipeline could be assigned the same weight by default. Or, `add_formula()` could have analogous variants to `add_model_propensity()` and `add_model_outcome()`.
 
-Recent work on post-processing in tidymodels shares the need for composability and ordering in workflows, so the needed infrastructure here is on its way soon anyway. The technical hurdles here, then, aren't actually too cumbersome.
+This is just one proposal for a workflow structure that could unify both of these models into one object; see [this issue](https://github.com/simonpcouch/r_causal/issues/1) for further discussion.
