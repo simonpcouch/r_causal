@@ -97,16 +97,23 @@ bootstrapped_net_data <- bootstraps(
    # required to calculate CIs later
    apparent = TRUE
 )
+```
 
-res_rc <- bootstrapped_net_data |>
-   mutate(boot_fits = map(splits, fit_ipw))
+We'll time each of these approaches to quantify the "tidymodels overhead," as well---see the [Timings] section for results.
+
+```{r res-rc}
+time_rc <- system.time({
+   res_rc <- 
+      bootstrapped_net_data |>
+      mutate(boot_fits = map(splits, fit_ipw))
+})
 
 res_rc
 ```
 
 To visualize the approximation of the sampling distribution for the causal estimate of the effect of introducing a `net`, extract the estimate from each of the 1000 model fits and build a histogram:
 
-```{r}
+```{r plot-rc}
 res_rc |>
   mutate(
     estimate = map_dbl(
@@ -125,7 +132,7 @@ res_rc |>
 
 A tidymodels-esque approach using only currently implemented syntax could switch out `lm()` and `glm()` for their tidymodels analogues. Otherwise, we'll follow the "as-is" apprach closely:
 
-```{r}
+```{r res-tm}
 set.seed(1)
 
 bootstrapped_net_data <- bootstraps(
@@ -153,13 +160,16 @@ fit_tm <- function(split, ...) {
 
 set.seed(1)
 
-res_tm <- bootstrapped_net_data %>%
-   mutate(boot_fits = map(splits, fit_tm))
+time_tm <- system.time({
+   res_tm <- 
+      bootstrapped_net_data %>%
+      mutate(boot_fits = map(splits, fit_tm))
+})
 ```
 
 Reproducing the same plot:
 
-```{r}
+```{r plot-tm}
 res_rc %>%
   mutate(
     estimate = map_dbl(
@@ -184,10 +194,11 @@ could feel expressive and flexible. Also, it effectively separates the propensit
 
 In reality, the ellipses in the above pseudocode are quite involved; we want to keep the splits from `bootstraps(data)` intact, while substituting the data that underlies them. That would look something like:
 
-```{r}
+```{r res-tm2}
 wf_propensity <- workflow(net ~ income + health + temperature, logistic_reg())
 wf_outcome <- workflow(malaria_risk ~ net, linear_reg())
 
+time_tm2 <- system.time({
 res_tm2 <- 
     # propensity fits ---------------------------------------------------------------------
    fit_resamples(
@@ -218,11 +229,12 @@ res_tm2 <-
       control = control_resamples(extract = tidy)
    ) %>%
    collect_extracts()
+})
 ```
 
 The row-wise mutate steps are especially tricky, and small mistakes in the bootstrap "substitution" code can lead to plausible-looking results that actually mischaractize the variation of the estimate. It does give the same results, though:
 
-```{r}
+```{r plot-tm2}
 res_tm2 %>%
    pull(.extracts) %>%
    bind_rows() %>%
@@ -358,34 +370,35 @@ The `causal` branch of infer implements a few modifications to the core function
 
 -   There is [already an issue](https://github.com/tidymodels/infer/issues/471) on the package repository proposing an argument, called `summarize` here, that summarizes `fit.infer()` output given some function other than `broom::tidy()`. Supplying something like `broom::augment()` to that argument effectively links the propensity model and the outcome model in one infer "pipeline."
 
-```{r}
+```{r res-in}
 set.seed(1)
+time_in <- system.time({
+   res_in <- net_data %>%
+      mutate(net = as.factor(net)) %>%
+      specify(net ~ income + health + temperature, keep = malaria_risk) %>%
+      generate(reps = 1000, type = "bootstrap") %>%
+      fit(summarize = function(model, data) {
+            bind_cols(data, data.frame(.pred = predict(model, data, type = "response")))
+          }) %>%
+      # note that `replicate` is already a grouping variable at this point.
+      mutate(wts = wt_ate(.pred, net, .treated = "TRUE"),
+             wts = importance_weights(wts)) %>%
+      specify(malaria_risk ~ net, keep = c(wts, replicate)) %>%
+      # problem: want to pass `wts` group-wise, but the weights argument is
+      # taken as a numeric vector rather than a quosure. can eventually work
+      # around in fit.infer if needed to properly vectorize on `replicate`.
+      nest(data = -replicate) %>%
+      rowwise() %>%
+      mutate(fit = list(fit(data, weights = data$wts))) %>%
+      unnest(fit)
+})
 
-res_in <- net_data %>%
-   mutate(net = as.factor(net)) %>%
-   specify(net ~ income + health + temperature, keep = malaria_risk) %>%
-   generate(reps = 1000, type = "bootstrap") %>%
-   fit(summarize = function(model, data) {
-         bind_cols(data, data.frame(.pred = predict(model, data, type = "response")))
-       }) %>%
-   # note that `replicate` is already a grouping variable at this point.
-   mutate(wts = wt_ate(.pred, net, .treated = "TRUE"),
-          wts = importance_weights(wts)) %>%
-   specify(malaria_risk ~ net, keep = c(wts, replicate)) %>%
-   # problem: want to pass `wts` group-wise, but the weights argument is
-   # taken as a numeric vector rather than a quosure. can eventually work
-   # around in fit.infer if needed to properly vectorize on `replicate`.
-   nest(data = -replicate) %>%
-   rowwise() %>%
-   mutate(fit = list(fit(data, weights = data$wts))) %>%
-   unnest(fit)
-   
 res_in
 ```
 
 And, it works:
 
-```{r}
+```{r plot-in}
 res_in %>%
   filter(term == "netTRUE") %>%
   ggplot(aes(estimate)) +
@@ -425,6 +438,8 @@ res_tm2 <-
 
 `augment_resamples` could live as its own helper, or even wrap an `augment.rset()` method as `augment.tune_results()`.
 
+The fit time for this approach would match `time_tm2`.
+
 ### A unified workflow
 
 Another alternative interface is to combine both the propensity and outcome models into one `workflow` object. This would allow for the user to just make one call to `fit_resamples()`, but:
@@ -449,6 +464,8 @@ causal_wf <-
 res_tm2 <- fit_resamples(causal_wf, bootstraps(net_data, 1000, apparent = TRUE))
 ```
 
+The fit time for this approach would also match `time_tm2`.
+
 Here:
 
 -   `add_propensity_weights()` is named to match patterning with `add_case_weights()`. Unlike that function, it does not take numeric values, because those values are determined by the output of the propensity model. It *does* need some function to take $(\hat{y}, y) \to c$ for propensity "outcome" $y$ and scores $c$, e.g. `wt_ate()` and friends.
@@ -458,3 +475,15 @@ Here:
 -   Associating pairs of preprocessors and models will require some thought---preprocessors and models with the same `weight` could be associated with each other, and pairs that appear consecutively in a pipeline could be assigned the same weight by default. Or, `add_formula()` could have analogous variants to `add_model_propensity()` and `add_model_outcome()`.
 
 This is just one proposal for a workflow structure that could unify both of these models into one object; see [this issue](https://github.com/simonpcouch/r_causal/issues/1) for further discussion.
+
+## Timings
+
+```{r}
+tribble(
+   ~approach,                             ~timing,
+   "As-is (rc)",                          time_rc[["elapsed"]],
+   "Tidymodels, no modifications (tm)",   time_tm[["elapsed"]],
+   "Tidymodels, no modifications (tm2)",  time_tm2[["elapsed"]],
+   "Tidymodels, infer (in)",              time_in[["elapsed"]]
+)
+```
